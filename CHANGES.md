@@ -1,3 +1,20 @@
+### 1.2.1
+
+type hints for compiling with Graal
+
+### 1.1.1
+
+[pr](https://github.com/yogthos/migratus/pull/151) that adds the optional `-- expect` sanity check in migrations
+[pr](https://github.com/yogthos/migratus/pull/150) that adds `:tx-handles-ddl?` flag that skips the automatic down that occurs on exception
+
+### 1.1.0
+
+- switched to use `db-do-commands` when applying migrations to address [issue 149](https://github.com/yogthos/migratus/issues/149)
+
+### 1.0.9
+
+[PR 144](https://github.com/yogthos/migratus/pull/144) removed \n in SQL to also allow windows line terminators.
+
 ### 1.0.8
 
 alter migration function to return nil if successful, `:ignore` or `:failure` when migrations are incomplete.

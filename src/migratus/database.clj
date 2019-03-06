@@ -15,12 +15,13 @@
   (:require [clojure.java.io :as io]
             [clojure.java.jdbc :as sql]
             [clojure.tools.logging :as log]
+            [clojure.string :as str]
             [migratus.migration.sql :as sql-mig]
             [migratus.protocols :as proto]
             [migratus.utils :as utils])
   (:import java.io.File
            [java.sql Connection SQLException]
-           java.util.jar.JarEntry))
+           [java.util.jar JarEntry JarFile]))
 
 (def default-migrations-table "schema_migrations")
 
@@ -31,9 +32,9 @@
 
 (defn mark-reserved [db table-name]
   (boolean
-   (try
-     (sql/insert! db table-name {:id reserved-id})
-     (catch Exception _))))
+    (try
+      (sql/insert! db table-name {:id reserved-id})
+      (catch Exception _))))
 
 (defn mark-unreserved [db table-name]
   (sql/delete! db table-name ["id=?" reserved-id]))
@@ -51,8 +52,8 @@
   (log/debug "marking" id "not complete")
   (sql/delete! db table-name ["id=?" id]))
 
-(defn migrate-up* [db config {:keys [name] :as migration}]
-  (let [id         (proto/id migration)
+(defn migrate-up* [db {:keys [tx-handles-ddl?] :as config} {:keys [name] :as migration}]
+  (let [id (proto/id migration)
         table-name (migration-table-name config)]
     (if (mark-reserved db table-name)
       (try
@@ -61,18 +62,21 @@
           (mark-complete db table-name name id)
           :success)
         (catch Throwable up-e
-          (log/error (format "Migration %s failed because %s backing out" name (.getMessage up-e)))
-          (try
-            (proto/down migration (assoc config :conn db))
-            (catch Throwable down-e
-              (log/debug down-e (format "As expected, one of the statements failed in %s while backing out the migration" name))))
+          (if tx-handles-ddl?
+            (log/error (format "Migration %s failed because %s" name (.getMessage up-e)))
+            (do
+              (log/error (format "Migration %s failed because %s backing out" name (.getMessage up-e)))
+              (try
+                (proto/down migration (assoc config :conn db))
+                (catch Throwable down-e
+                  (log/debug down-e (format "As expected, one of the statements failed in %s while backing out the migration" name))))))
           (throw up-e))
         (finally
           (mark-unreserved db table-name)))
       :ignore)))
 
 (defn migrate-down* [db config migration]
-  (let [id         (proto/id migration)
+  (let [id (proto/id migration)
         table-name (migration-table-name config)]
     (if (mark-reserved db table-name)
       (try
@@ -86,11 +90,12 @@
 
 (defn find-init-script-file [migration-dir init-script-name]
   (first
-   (filter (fn [^File f] (and (.isFile f) (= (.getName f) init-script-name)))
-           (file-seq migration-dir))))
+    (filter (fn [^File f] (and (.isFile f) (= (.getName f) init-script-name)))
+            (file-seq migration-dir))))
 
-(defn find-init-script-resource [migration-dir jar init-script-name]
-  (let [init-script-path (.getPath (io/file migration-dir init-script-name))]
+(defn find-init-script-resource [migration-dir ^JarFile jar init-script-name]
+  (let [init-script-path (utils/normalize-path
+                          (.getPath (io/file migration-dir init-script-name)))]
     (->> (.entries jar)
          (enumeration-seq)
          (filter (fn [^JarEntry entry]
@@ -115,7 +120,7 @@
     {:connection conn}))
 
 (defn disconnect* [db]
-  (when-let [conn (:connection db)]
+  (when-let [^Connection conn (:connection db)]
     (when-not (.isClosed conn)
       (.close conn))))
 
@@ -155,18 +160,27 @@
       (catch SQLException _
         false))))
 
+(defn datetime-backend?
+  "Checks whether the underlying backend requires the applied column to be
+  of type datetime instead of timestamp."
+  [db]
+  (let [^Connection conn (:connection db)
+        db-name (.. conn getMetaData getDatabaseProductName)]
+    (if (= "Microsoft SQL Server" db-name)
+      "DATETIME"
+      "TIMESTAMP")))
 
 (defn create-migration-table!
   "Creates the schema for the migration table via t-con in db in table-name"
   [db modify-sql-fn table-name]
   (log/info "creating migration table" (str "'" table-name "'"))
-  (sql/with-db-transaction
-    [t-con db]
-    (sql/db-do-commands t-con
-                        (modify-sql-fn
-                         (sql/create-table-ddl table-name [[:id "BIGINT" "UNIQUE" "NOT NULL"]
-                                                           [:applied "TIMESTAMP" "" ""]
-                                                           [:description "VARCHAR(1024)" "" ""]])))))
+  (let [timestamp-column-type (datetime-backend? db)]
+    (sql/with-db-transaction [t-con db]
+      (sql/db-do-commands t-con
+                          (modify-sql-fn
+                           (sql/create-table-ddl table-name [[:id "BIGINT" "UNIQUE" "NOT NULL"]
+                                                             [:applied timestamp-column-type "" ""]
+                                                             [:description "VARCHAR(1024)" "" ""]]))))))
 
 (defn update-migration-table!
   "Updates the schema for the migration table via t-con in db in table-name"
@@ -176,8 +190,8 @@
     [t-con db]
     (sql/db-do-commands t-con
                         (modify-sql-fn
-                         [(str "ALTER TABLE " table-name " ADD COLUMN description varchar(1024)")
-                          (str "ALTER TABLE " table-name " ADD COLUMN applied timestamp")]))))
+                          [(str "ALTER TABLE " table-name " ADD COLUMN description varchar(1024)")
+                           (str "ALTER TABLE " table-name " ADD COLUMN applied timestamp")]))))
 
 
 (defn init-schema! [db table-name modify-sql-fn]
@@ -249,5 +263,3 @@
 (defmethod proto/make-store :database
   [config]
   (->Database (atom nil) config))
-
-

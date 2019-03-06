@@ -5,50 +5,82 @@
     [clojure.tools.logging :as log]
     [migratus.protocols :as proto])
   (:import
+    java.sql.SQLException
     java.util.regex.Pattern))
 
-(def sep (Pattern/compile "^.*--;;.*\r?\n" Pattern/MULTILINE))
-(def sql-comment (Pattern/compile "^--.*" Pattern/MULTILINE))
-(def empty-line (Pattern/compile "^[ ]+" Pattern/MULTILINE))
+(def ^Pattern sep (Pattern/compile "^.*--;;.*\r?\n" Pattern/MULTILINE))
+(def ^Pattern sql-comment (Pattern/compile "^--.*" Pattern/MULTILINE))
+(def ^Pattern sql-comment-without-expect (Pattern/compile "^--((?! *expect).)*$" Pattern/MULTILINE))
+(def ^Pattern empty-line (Pattern/compile "^[ ]+" Pattern/MULTILINE))
 
 (defn use-tx? [sql]
   (not (str/starts-with? sql "-- :disable-transaction")))
 
-(defn sanitize [command]
+(defn sanitize [command expect-results?]
   (-> command
-      (clojure.string/replace sql-comment "")
+      (clojure.string/replace (if expect-results? sql-comment-without-expect sql-comment) "")
       (clojure.string/replace empty-line "")))
 
-(defn split-commands [commands]
+(defn split-commands [commands expect-results?]
   (->> (.split sep commands)
-       (map sanitize)
+       (map #(sanitize % expect-results?))
        (remove empty?)
        (not-empty)))
 
-(defn execute-command [t-con tx? c]
-  (log/trace "executing" c)
-  (try
-    (sql/db-do-prepared t-con tx? c)
-    (catch Throwable t
-      (log/error (format "failed to execute command:\n %s\nFailure: %s" c (.getMessage t)))
-      (throw t))))
+(defn check-expectations [result c]
+  (let [[full-str expect-str command] (re-matches #"(?sm).*\s*-- expect (.*);;\n+(.*)" c)]
+    (assert expect-str (str "No expectation on command: " c))
+    (let [expected   (some-> expect-str Long/parseLong)
+          actual     (some-> result first)
+          different? (not= actual expected)
+          message    (format "%s %d"
+                             (some-> command (clojure.string/split #"\s+" 2) first clojure.string/upper-case)
+                             actual)]
+      (if different?
+        (log/error message "Expected" expected)
+        (log/info message)))))
+
+(defn parse-commands-sql [{:keys [command-separator]} commands]
+  (if command-separator
+    (->>
+      (str/split commands (re-pattern command-separator))
+      (map str/trim)
+      (remove empty?))
+    commands))
+
+(defn execute-command [config t-con tx? expect-results? commands]
+  (log/trace "executing" commands)
+  (cond->
+    (try
+      (sql/db-do-commands t-con tx? (parse-commands-sql config commands))
+      (catch SQLException e
+        (log/error (format "failed to execute command:\n %s" commands))
+        (loop [e e]
+          (if-let [next-e (.getNextException e)]
+            (recur next-e)
+            (log/error (.getMessage e))))
+        (throw e))
+      (catch Throwable t
+        (log/error (format "failed to execute command:\n %s\nFailure: %s" commands (.getMessage t)))
+        (throw t)))
+    expect-results? (check-expectations commands)))
 
 (defn- run-sql*
-  [conn tx? commands direction]
+  [config conn tx? expect-results? commands direction]
   (log/debug "found" (count commands) (name direction) "migrations")
   (doseq [c commands]
-    (execute-command conn tx? c)))
+    (execute-command config conn tx? expect-results? c)))
 
 (defn run-sql
-  [{:keys [conn db modify-sql-fn]} sql direction]
-  (when-let [commands (map (or modify-sql-fn identity) (split-commands sql))]
+  [{:keys [conn db modify-sql-fn expect-results?] :as config} sql direction]
+  (when-let [commands (map (or modify-sql-fn identity) (split-commands sql expect-results?))]
     (if (use-tx? sql)
       (sql/with-db-transaction
         [t-con (or conn db)]
-        (run-sql* t-con true commands direction))
+        (run-sql* config t-con true expect-results? commands direction))
       (sql/with-db-connection
         [t-con (or conn db)]
-        (run-sql* t-con false commands direction)))))
+        (run-sql* config t-con false expect-results? commands direction)))))
 
 (defrecord SqlMigration [id name up down]
   proto/Migration
@@ -80,6 +112,6 @@
 
 (defmethod proto/migration-files* :sql
   [x migration-name]
-  (let [ext  (proto/get-extension* x)]
+  (let [ext (proto/get-extension* x)]
     [(str migration-name ".up." ext)
      (str migration-name ".down." ext)]))
